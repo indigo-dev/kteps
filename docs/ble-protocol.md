@@ -120,3 +120,21 @@ Transmitted on state changes or fault conditions.
 * **Packet Format:** 1 Byte (UInt8, range `0..100`%).
 * **Characteristics & Quirk:** Many Shimano wireless units (especially older EW-EN100 firmware builds) do not reliably publish automatic push notifications for battery percentage changes.
 * **Kteps Solution:** A hybrid approach combining instantaneous notification processing with a periodic 10-second active GATT read fallback to keep the battery percentage accurate throughout long rides.
+
+---
+
+## 5. Connection Parameter Negotiation Quirk (`status=59` / `0x3B`)
+
+Shimano wireless gateways such as the **EW-EN100** run on a Nordic Semiconductor nRF51 SoftDevice using Nordic SDK's `ble_conn_params` module configured with:
+* `start_on_notify_cccd_handle = 0x2AC1` (telemetry CCCD)
+* Preferred parameters: `min_interval = 50` (`62.5 ms`), `max_interval = 100` (`125.0 ms`), `latency = 0`, `timeout = 600` (`6.0 s`)
+* `max_conn_params_update_count = 1`, `disconnect_on_fail = true`
+
+During full GATT service discovery, Android Fluoride temporarily switches the BLE link to `interval = 6` (`7.5 ms`). Immediately after discovery finishes, Android issues an `HCI_LE_Connection_Update` back to `interval = 36` (`45.0 ms`), which takes ~85 ms to complete over the air.
+
+If the client writes the `0x2AC1` CCCD before that post-discovery update completes:
+1. Writing `0x2AC1` CCCD arms `ble_conn_params` on the bike, which sees `7.5 ms` and immediately sends `L2CAP_CMD_BLE_UPDATE_REQ (62.5–125 ms)`, consuming its single allowed update attempt (`update_count = 1`).
+2. Android queues the bike's request behind its already-in-flight `45 ms` update.
+3. When the `45 ms` update lands first (~45 ms later), the bike sees `45 ms < 62.5 ms` with `update_count == 1` and immediately terminates the link with `0x3B` (`status = 59`, `HCI_ERR_CONN_INTERVAL_UNACCEPTABLE`).
+
+**Kteps Solution:** Wait `600 ms` (`POST_DISCOVERY_SETTLE_MS`) after `onServicesDiscovered` before reading `0x2A19` and enabling `0x2AC1` notifications so Android's `45 ms` transition finishes while `ble_conn_params` is still unarmed, allowing the bike's subsequent `62.5–125 ms` L2CAP request to succeed cleanly on the first attempt.

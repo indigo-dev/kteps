@@ -24,6 +24,7 @@ object ShimanoBleParser {
 
     const val SHIMANO_COMPANY_ID = 0x044A
     private const val SHIMANO_UUID_SUFFIX = "-5348-494d-414e-4f5f424c4500"
+    private const val BLUETOOTH_SIG_UUID_SUFFIX = "-0000-1000-8000-00805f9b34fb"
 
     data class TelemetryParseResult(
         val telemetry: KtepsTelemetry,
@@ -44,14 +45,16 @@ object ShimanoBleParser {
 
     /**
      * Checks if a UUID matches Shimano's proprietary BLE service format
-     * (either the full 128-bit SHIMANO_BLE suffix or 16-bit representation of 0x18EF/0x18FF/0x18FE).
+     * (either the full 128-bit SHIMANO_BLE suffix or 16-bit SIG expansion of 0x18EF/0x18FF).
+     * Excludes non-Shimano 0x18FE vendor UUIDs such as Nordic Semiconductor's Legacy DFU service.
      */
     fun isShimanoServiceUuid(uuid: UUID): Boolean {
         val str = uuid.toString().lowercase()
-        return str.endsWith(SHIMANO_UUID_SUFFIX.lowercase()) ||
-            str.startsWith("000018ef-") ||
-            str.startsWith("000018ff-") ||
-            str.startsWith("000018fe-")
+        if (str.endsWith(SHIMANO_UUID_SUFFIX)) {
+            return true
+        }
+        return str.endsWith(BLUETOOTH_SIG_UUID_SUFFIX) &&
+            (str.startsWith("000018ef-") || str.startsWith("000018ff-"))
     }
 
     fun isShimanoAdvertisement(

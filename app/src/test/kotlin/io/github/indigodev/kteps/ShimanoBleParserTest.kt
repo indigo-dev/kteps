@@ -247,14 +247,21 @@ class ShimanoBleParserTest {
     }
 
     @Test
-    fun `isShimanoServiceUuid detects 128-bit and 16-bit Shimano services`() {
+    fun `isShimanoServiceUuid detects 128-bit and 16-bit Shimano services and rejects Nordic DFU`() {
         assertTrue(ShimanoBleParser.isShimanoServiceUuid(ShimanoBleParser.SERVICE_SHIMANO_DFLY))
         assertTrue(ShimanoBleParser.isShimanoServiceUuid(ShimanoBleParser.SERVICE_SHIMANO_AUTH))
         assertTrue(ShimanoBleParser.isShimanoServiceUuid(UUID.fromString("000018fe-5348-494d-414e-4f5f424c4500")))
         assertTrue(ShimanoBleParser.isShimanoServiceUuid(UUID.fromString("000018ef-0000-1000-8000-00805f9b34fb")))
         assertTrue(ShimanoBleParser.isShimanoServiceUuid(UUID.fromString("000018ff-0000-1000-8000-00805f9b34fb")))
 
+        assertFalse(ShimanoBleParser.isShimanoServiceUuid(UUID.fromString("000018fe-1212-efde-1523-785feabcd123")))
         assertFalse(ShimanoBleParser.isShimanoServiceUuid(UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")))
         assertFalse(ShimanoBleParser.isShimanoServiceUuid(UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")))
+        assertFalse(
+            ShimanoBleParser.isShimanoAdvertisement(
+                deviceName = "Nordic Sensor",
+                serviceUuids = listOf(UUID.fromString("000018fe-1212-efde-1523-785feabcd123"))
+            )
+        )
     }
 }

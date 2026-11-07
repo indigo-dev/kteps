@@ -42,12 +42,40 @@ class KtepsManager(
     companion object {
         private const val TAG = "Kteps"
         private const val RECONNECT_DELAY_MS = 3_000L
-        private const val FAST_RECONNECT_DELAY_MS = 600L
+        private const val FAST_RECONNECT_DELAY_MS = 1_200L
+        private const val BLE_ENABLING_RETRY_MS = 600L
         private const val DISCONNECT_GRACE_MS = 15_000L
         private const val SERVICE_DISCOVERY_DELAY_MS = 250L
 
-        /** Max time from connectGatt() until STATE_CONNECTED before aborting the attempt. */
-        private const val CONNECT_TIMEOUT_MS = 30_000L
+        /**
+         * Settle window after service discovery finishes before subscribing to 0x2AC1.
+         *
+         * During full GATT service discovery Android Fluoride switches the link to interval=6
+         * (7.5ms) and, upon completion, issues an HCI_LE_Connection_Update back to interval=36
+         * (45ms) that takes ~85ms to complete over the air. Writing 0x2AC1 CCCD while that update
+         * is still in flight arms Shimano's Nordic ble_conn_params (start_on_notify_cccd_handle =
+         * 0x2AC1, max_conn_params_update_count = 1, disconnect_on_fail = true), which immediately
+         * sends L2CAP_CMD_BLE_UPDATE_REQ (62.5–125ms). When Android's in-flight 45ms update lands
+         * first, EW-EN100 treats 45ms < 62.5ms as a failed negotiation and disconnects with 0x3B
+         * (status=59). Waiting here guarantees Android's post-discovery update finishes first.
+         */
+        private const val POST_DISCOVERY_SETTLE_MS = 600L
+        private const val POST_DISCOVERY_SETTLE_STEP_MS = 400L
+        private const val POST_DISCOVERY_SETTLE_MAX_MS = 1_400L
+
+        /**
+         * Stabilization window after enabling 0x2AC1 notifications before reporting CONNECTED to
+         * Karoo OS, allowing the peripheral's L2CAP connection parameter negotiation (~270ms) and
+         * initial telemetry packets to settle without flapping sensor streams.
+         */
+        private const val CONNECTION_STABILIZATION_MS = 500L
+
+        /**
+         * Max time from connectGatt() until STATE_CONNECTED before aborting the attempt.
+         * Kept slightly above Android's native 30s direct-connect timeout (status=255) to avoid
+         * racing the stack's own teardown callback.
+         */
+        private const val CONNECT_TIMEOUT_MS = 32_000L
 
         /** Max time from STATE_CONNECTED until telemetry notifications are confirmed. */
         private const val HANDSHAKE_TIMEOUT_MS = 15_000L
@@ -58,10 +86,14 @@ class KtepsManager(
         /** GATT_ERROR as reported by many stacks when the peer is out of range / switched off. */
         private const val GATT_STATUS_GENERIC_ERROR = 255
 
+        /** HCI_ERR_CONN_INTERVAL_UNACCEPTABLE (0x3B), sent by Nordic SoftDevice on param mismatch. */
+        private const val GATT_CONN_INTERVAL_UNACCEPTABLE = 59
+
         /** GATT error codes for security/authentication required (triggers bonding/pairing). */
         private const val GATT_INSUFFICIENT_AUTHENTICATION = 5
         private const val GATT_INSUFFICIENT_AUTHORIZATION = 8
         private const val GATT_INSUFFICIENT_ENCRYPTION = 15
+        private const val GATT_AUTH_FAIL = 137
 
         /** Max time to wait when user enters passkey / confirms pairing on bike display or Karoo. */
         private const val BONDING_TIMEOUT_MS = 60_000L
@@ -79,10 +111,11 @@ class KtepsManager(
         IDLE,
         CONNECTING,
         DISCOVERING_SERVICES,
+        SETTLING_CONN_PARAMS,
         WAITING_FOR_BOND,
         READING_BATTERY,
         SUBSCRIBING_TELEMETRY,
-        SUBSCRIBING_BATTERY,
+        STABILIZING,
         READY
     }
 
@@ -97,10 +130,15 @@ class KtepsManager(
     private var reconnectJob: Job? = null
     private var disconnectGraceJob: Job? = null
     private var serviceDiscoveryJob: Job? = null
+    private var postDiscoveryJob: Job? = null
+    private var stabilizationJob: Job? = null
     private var handshakeWatchdogJob: Job? = null
     private var connectTimeoutJob: Job? = null
     private var batteryPollJob: Job? = null
     private var handshakeStage = HandshakeStage.IDLE
+    private var consecutiveFastFailures = 0
+    private var consecutiveIntervalErrors = 0
+    private var authRetryCount = 0
     private var activeScanCallback: ScanCallback? = null
     private var nextToken = 1L
     private val activeTokens = mutableSetOf<Long>()
@@ -128,30 +166,41 @@ class KtepsManager(
             val bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
             val prevBondState = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR)
 
+            var resumedBond = false
+            var gattToRestart: BluetoothGatt? = null
+
             synchronized(gattLock) {
                 if (device.address != targetMacAddress) return
                 val gatt = bluetoothGatt ?: return
-                if (!isActiveGatt(gatt)) return
+                if (handshakeStage != HandshakeStage.WAITING_FOR_BOND) return
 
                 when (bondState) {
                     BluetoothDevice.BOND_BONDED -> {
-                        Log.i(TAG, "Device ${device.address} successfully bonded! Resuming GATT handshake...")
-                        ExtensionDiagnostics.onGattEvent("deviceBonded")
+                        handshakeStage = HandshakeStage.SETTLING_CONN_PARAMS
                         startHandshakeWatchdogLocked(gatt)
-                        val batteryChar = findBatteryCharacteristic(gatt)
-                        if (batteryChar != null && setHandshakeStage(gatt, HandshakeStage.READING_BATTERY)) {
-                            if (readCharacteristicSafely(gatt, batteryChar)) return
+                        postDiscoveryJob?.cancel()
+                        postDiscoveryJob = scope.launch {
+                            delay(POST_DISCOVERY_SETTLE_MS)
+                            beginPostDiscoveryHandshake(gatt)
                         }
-                        subscribeTelemetry(gatt)
+                        resumedBond = true
                     }
                     BluetoothDevice.BOND_NONE -> {
                         if (prevBondState == BluetoothDevice.BOND_BONDING) {
-                            Log.w(TAG, "Bonding failed or cancelled for ${device.address}")
-                            ExtensionDiagnostics.onError("Bonding failed or rejected")
-                            restartConnection(gatt, "bonding cancelled by user/device", delayMs = RECONNECT_DELAY_MS)
+                            gattToRestart = gatt
                         }
                     }
                 }
+            }
+
+            if (resumedBond) {
+                Log.i(TAG, "Device ${device.address} successfully bonded! Resuming GATT handshake...")
+                ExtensionDiagnostics.onGattEvent("deviceBonded")
+            }
+            gattToRestart?.let { gatt ->
+                Log.w(TAG, "Bonding failed or cancelled for ${device.address}")
+                ExtensionDiagnostics.onError("Bonding failed or rejected")
+                restartConnection(gatt, "bonding cancelled by user/device", delayMs = RECONNECT_DELAY_MS)
             }
         }
     }
@@ -437,17 +486,24 @@ class KtepsManager(
         val token: Long
         val shouldOpenNewGatt: Boolean
         synchronized(gattLock) {
+            val hadConsumers = activeTokens.isNotEmpty()
             token = nextToken++
             activeTokens.add(token)
             ExtensionDiagnostics.onConsumersChanged(activeTokens.size)
             disconnectGraceJob?.cancel()
             disconnectGraceJob = null
 
-            if (targetMacAddress == macAddress && bluetoothGatt != null) {
+            if (targetMacAddress == macAddress &&
+                (bluetoothGatt != null || (hadConsumers && reconnectJob?.isActive == true))
+            ) {
                 shouldOpenNewGatt = false
             } else {
-                if (targetMacAddress != null && targetMacAddress != macAddress) {
-                    sessionStartOdoMeters = null
+                if (targetMacAddress != macAddress) {
+                    if (targetMacAddress != null) {
+                        sessionStartOdoMeters = null
+                    }
+                    consecutiveFastFailures = 0
+                    consecutiveIntervalErrors = 0
                 }
                 targetMacAddress = macAddress
                 reconnectJob?.cancel()
@@ -494,6 +550,8 @@ class KtepsManager(
         disconnectGraceJob?.cancel()
         disconnectGraceJob = null
         targetMacAddress = null
+        consecutiveFastFailures = 0
+        consecutiveIntervalErrors = 0
         reconnectJob?.cancel()
         reconnectJob = null
         closeGattLocked(disconnectFirst = isGattConnectedLocked())
@@ -527,8 +585,8 @@ class KtepsManager(
         when (ensureBleEnabled(adapter)) {
             BleAvailability.READY -> Unit
             BleAvailability.ENABLING -> {
-                Log.w(TAG, "Bluetooth LE turning on, retrying in ${FAST_RECONNECT_DELAY_MS}ms")
-                scheduleReconnect(macAddress, FAST_RECONNECT_DELAY_MS)
+                Log.w(TAG, "Bluetooth LE turning on, retrying in ${BLE_ENABLING_RETRY_MS}ms")
+                scheduleReconnect(macAddress, BLE_ENABLING_RETRY_MS)
                 return
             }
             BleAvailability.UNAVAILABLE -> {
@@ -621,10 +679,15 @@ class KtepsManager(
         connectTimeoutJob = null
         serviceDiscoveryJob?.cancel()
         serviceDiscoveryJob = null
+        postDiscoveryJob?.cancel()
+        postDiscoveryJob = null
+        stabilizationJob?.cancel()
+        stabilizationJob = null
         handshakeWatchdogJob?.cancel()
         handshakeWatchdogJob = null
         batteryPollJob?.cancel()
         batteryPollJob = null
+        authRetryCount = 0
         handshakeStage = HandshakeStage.IDLE
         val gatt = bluetoothGatt ?: return
         bluetoothGatt = null
@@ -758,9 +821,22 @@ class KtepsManager(
                 ExtensionDiagnostics.onGattConnected()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.w(TAG, "Disconnected from ${gatt.device.address} (status=$status)")
+                if (status == GATT_CONN_INTERVAL_UNACCEPTABLE) {
+                    Log.w(
+                        TAG,
+                        "Peripheral rejected connection interval (status=59 / 0x3B); extending post-discovery settle delay on retry"
+                    )
+                }
                 ExtensionDiagnostics.onGattDisconnected(status)
-                synchronized(gattLock) {
+                val retryDelayMs = synchronized(gattLock) {
                     if (bluetoothGatt === gatt) {
+                        val wasReady = handshakeStage == HandshakeStage.READY
+                        if (status == GATT_CONN_INTERVAL_UNACCEPTABLE) {
+                            consecutiveIntervalErrors++
+                        }
+                        if (!wasReady) {
+                            consecutiveFastFailures++
+                        }
                         closeGattLocked(disconnectFirst = false)
                     } else {
                         try {
@@ -776,14 +852,14 @@ class KtepsManager(
                             cadenceRpm = 0
                         )
                     }
-                }
-                if (mac != null) {
-                    val delayMs = if (status == GATT_STATUS_GENERIC_ERROR) {
+                    if (status == GATT_STATUS_GENERIC_ERROR || consecutiveFastFailures > 2) {
                         RECONNECT_DELAY_MS
                     } else {
                         FAST_RECONNECT_DELAY_MS
                     }
-                    scheduleReconnect(mac, delayMs)
+                }
+                if (mac != null) {
+                    scheduleReconnect(mac, retryDelayMs)
                 }
             }
         }
@@ -801,12 +877,15 @@ class KtepsManager(
 
             val hasDfly = gatt.getService(ShimanoBleParser.SERVICE_SHIMANO_DFLY) != null
             val telemetryChar = findTelemetryCharacteristic(gatt)
-            val hasAuth = gatt.getService(ShimanoBleParser.SERVICE_SHIMANO_AUTH) != null
-            val isKnownUnsupported = ShimanoBleParser.isUnsupportedModel(gatt.device.name)
+            val rawDeviceName = runCatching { gatt.device.name }.getOrNull()
+            val isKnownUnsupported = ShimanoBleParser.isUnsupportedModel(rawDeviceName)
 
             if (!hasDfly || telemetryChar == null) {
-                if (isKnownUnsupported || hasAuth) {
-                    val modelName = gatt.device.name?.ifBlank { "Shimano Device" } ?: "Shimano Device"
+                // Only permanently abort for explicitly known unsupported display units (e.g. SC-E8000).
+                // Never use SERVICE_SHIMANO_AUTH (0x18FF) as a heuristic here: EW-EN100, SC-EM800, and
+                // SC-E7000 all expose 0x18FF alongside 0x18EF, so a partial GATT cache must refresh & retry.
+                if (isKnownUnsupported) {
+                    val modelName = rawDeviceName?.ifBlank { "Shimano Device" } ?: "Shimano Device"
                     val errorMsg = "Incompatible device: $modelName lacks BLE telemetry (SC-E8000 not supported)"
                     Log.e(TAG, errorMsg)
                     ExtensionDiagnostics.onError(errorMsg)
@@ -835,14 +914,23 @@ class KtepsManager(
                 return
             }
 
-            // Match original proven handshake: read Battery Level (0x2A19) first, then enable 0x2AC1 notifications
-            val batteryChar = findBatteryCharacteristic(gatt)
-            if (batteryChar != null && setHandshakeStage(gatt, HandshakeStage.READING_BATTERY)) {
-                if (readCharacteristicSafely(gatt, batteryChar)) {
-                    return
+            // Wait for Android's post-discovery connection interval update (7.5ms -> 45ms, ~85ms OTA)
+            // to finish before arming Shimano's ble_conn_params state machine via 0x2AC1 CCCD write.
+            val settleMs = synchronized(gattLock) {
+                if (gatt !== bluetoothGatt) return
+                handshakeStage = HandshakeStage.SETTLING_CONN_PARAMS
+                val computedSettleMs =
+                    (POST_DISCOVERY_SETTLE_MS + consecutiveIntervalErrors * POST_DISCOVERY_SETTLE_STEP_MS)
+                        .coerceAtMost(POST_DISCOVERY_SETTLE_MAX_MS)
+                postDiscoveryJob?.cancel()
+                postDiscoveryJob = scope.launch {
+                    delay(computedSettleMs)
+                    beginPostDiscoveryHandshake(gatt)
                 }
+                computedSettleMs
             }
-            subscribeTelemetry(gatt)
+            Log.d(TAG, "Services discovered; waiting ${settleMs}ms for BLE connection parameters to settle...")
+            ExtensionDiagnostics.onGattEvent("settle(${settleMs}ms)")
         }
 
         override fun onCharacteristicRead(
@@ -878,26 +966,14 @@ class KtepsManager(
                 return
             }
 
-            when {
-                stage == HandshakeStage.SUBSCRIBING_TELEMETRY &&
-                    characteristicUuid == ShimanoBleParser.CHAR_SHIMANO_TELEMETRY -> {
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        ExtensionDiagnostics.onGattEvent("notify(0x2AC1)")
-                        onTelemetrySubscribed(gatt)
-                    } else {
-                        restartConnection(gatt, "enable 0x2AC1 notifications failed ($status)")
-                    }
-                }
-
-                stage == HandshakeStage.SUBSCRIBING_BATTERY &&
-                    characteristicUuid == ShimanoBleParser.CHAR_BATTERY_LEVEL -> {
-                    if (status == BluetoothGatt.GATT_SUCCESS) {
-                        ExtensionDiagnostics.onGattEvent("notify(0x2A19)")
-                    } else {
-                        // Not fatal: the periodic battery read keeps the value up to date.
-                        Log.w(TAG, "Enabling battery notifications failed (status=$status)")
-                    }
-                    completeHandshake(gatt)
+            if (stage == HandshakeStage.SUBSCRIBING_TELEMETRY &&
+                characteristicUuid == ShimanoBleParser.CHAR_SHIMANO_TELEMETRY
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    ExtensionDiagnostics.onGattEvent("notify(0x2AC1)")
+                    onTelemetrySubscribed(gatt)
+                } else {
+                    restartConnection(gatt, "enable 0x2AC1 notifications failed ($status)")
                 }
             }
         }
@@ -909,9 +985,9 @@ class KtepsManager(
         ) {
             if (!isActiveGatt(gatt)) return
             if (characteristic.uuid == ShimanoBleParser.CHAR_SHIMANO_TELEMETRY &&
-                currentHandshakeStage(gatt) != HandshakeStage.READY
+                currentHandshakeStage(gatt) == HandshakeStage.SUBSCRIBING_TELEMETRY
             ) {
-                completeHandshake(gatt)
+                onTelemetrySubscribed(gatt)
             }
             handleCharacteristicData(characteristic.uuid, value)
         }
@@ -924,13 +1000,25 @@ class KtepsManager(
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
                 if (!isActiveGatt(gatt)) return
                 if (characteristic.uuid == ShimanoBleParser.CHAR_SHIMANO_TELEMETRY &&
-                    currentHandshakeStage(gatt) != HandshakeStage.READY
+                    currentHandshakeStage(gatt) == HandshakeStage.SUBSCRIBING_TELEMETRY
                 ) {
-                    completeHandshake(gatt)
+                    onTelemetrySubscribed(gatt)
                 }
                 handleCharacteristicData(characteristic.uuid, characteristic.value)
             }
         }
+    }
+
+    private fun beginPostDiscoveryHandshake(gatt: BluetoothGatt) {
+        if (!isActiveGatt(gatt)) return
+        // Read Battery Level (0x2A19) first, then enable 0x2AC1 notifications
+        val batteryChar = findBatteryCharacteristic(gatt)
+        if (batteryChar != null && setHandshakeStage(gatt, HandshakeStage.READING_BATTERY)) {
+            if (readCharacteristicSafely(gatt, batteryChar)) {
+                return
+            }
+        }
+        subscribeTelemetry(gatt)
     }
 
     private fun isActiveGatt(gatt: BluetoothGatt): Boolean =
@@ -982,22 +1070,55 @@ class KtepsManager(
     private fun isAuthenticationOrEncryptionError(status: Int): Boolean =
         status == GATT_INSUFFICIENT_AUTHENTICATION ||
             status == GATT_INSUFFICIENT_AUTHORIZATION ||
-            status == GATT_INSUFFICIENT_ENCRYPTION
+            status == GATT_INSUFFICIENT_ENCRYPTION ||
+            status == GATT_AUTH_FAIL
 
     @SuppressLint("MissingPermission")
     private fun handleAuthenticationRequired(gatt: BluetoothGatt, reason: String) {
         if (!isActiveGatt(gatt)) return
-        Log.w(TAG, "GATT authentication or encryption required ($reason). Waiting for bonding...")
-        ExtensionDiagnostics.onGattEvent("authRequired($reason)")
-
-        setHandshakeStage(gatt, HandshakeStage.WAITING_FOR_BOND)
-        extendHandshakeTimeoutForBonding(gatt)
 
         val bondState = try {
             gatt.device.bondState
         } catch (_: SecurityException) {
             BluetoothDevice.BOND_NONE
         }
+
+        if (bondState == BluetoothDevice.BOND_BONDED) {
+            val shouldRestart = synchronized(gattLock) {
+                if (gatt !== bluetoothGatt) return
+                if (authRetryCount >= 1) {
+                    true
+                } else {
+                    authRetryCount++
+                    handshakeStage = HandshakeStage.SETTLING_CONN_PARAMS
+                    startHandshakeWatchdogLocked(gatt)
+                    postDiscoveryJob?.cancel()
+                    postDiscoveryJob = scope.launch {
+                        delay(POST_DISCOVERY_SETTLE_MS)
+                        beginPostDiscoveryHandshake(gatt)
+                    }
+                    false
+                }
+            }
+            if (shouldRestart) {
+                Log.w(TAG, "Authentication failed despite existing bond ($reason); restarting GATT")
+                restartConnection(
+                    gatt,
+                    "authentication failed despite existing bond ($reason)",
+                    delayMs = RECONNECT_DELAY_MS
+                )
+            } else {
+                Log.i(TAG, "Device already bonded ($reason); waiting for link encryption before retrying...")
+                ExtensionDiagnostics.onGattEvent("encryptingLink($reason)")
+            }
+            return
+        }
+
+        Log.w(TAG, "GATT authentication or encryption required ($reason). Waiting for bonding...")
+        ExtensionDiagnostics.onGattEvent("authRequired($reason)")
+
+        if (!setHandshakeStage(gatt, HandshakeStage.WAITING_FOR_BOND)) return
+        extendHandshakeTimeoutForBonding(gatt)
 
         if (bondState == BluetoothDevice.BOND_NONE) {
             val started = try {
@@ -1007,6 +1128,9 @@ class KtepsManager(
                 false
             }
             Log.i(TAG, "Triggered createBond() for ${gatt.device.address}: $started")
+            if (!started) {
+                restartConnection(gatt, "createBond() returned false", delayMs = RECONNECT_DELAY_MS)
+            }
         }
     }
 
@@ -1040,17 +1164,34 @@ class KtepsManager(
         }
     }
 
-    /** Telemetry notifications are active; complete the handshake immediately. */
+    /**
+     * Telemetry notifications are enabled; wait briefly for peripheral L2CAP connection parameter
+     * negotiation (~270ms) and initial packets to settle before reporting CONNECTED to Karoo OS.
+     */
     private fun onTelemetrySubscribed(gatt: BluetoothGatt) {
-        completeHandshake(gatt)
+        synchronized(gattLock) {
+            if (gatt !== bluetoothGatt) return
+            if (handshakeStage == HandshakeStage.STABILIZING || handshakeStage == HandshakeStage.READY) return
+            handshakeStage = HandshakeStage.STABILIZING
+            stabilizationJob?.cancel()
+            stabilizationJob = scope.launch {
+                delay(CONNECTION_STABILIZATION_MS)
+                completeHandshake(gatt)
+            }
+        }
     }
 
     private fun completeHandshake(gatt: BluetoothGatt) {
         val newlyCompleted = synchronized(gattLock) {
             if (gatt !== bluetoothGatt || handshakeStage == HandshakeStage.READY) return
             handshakeStage = HandshakeStage.READY
+            consecutiveFastFailures = 0
+            consecutiveIntervalErrors = 0
+            authRetryCount = 0
             handshakeWatchdogJob?.cancel()
             handshakeWatchdogJob = null
+            stabilizationJob?.cancel()
+            stabilizationJob = null
             startBatteryPollLocked(gatt)
             _telemetry.update { it.copy(connected = true) }
             true
