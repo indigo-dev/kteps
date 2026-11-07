@@ -42,7 +42,7 @@ The display or junction unit acts as the Bluetooth LE gateway for the entire Shi
 | **SC-EN600 / SC-EN610** | Compact Color Display | EW-SD300 | ✅ **Supported** | Latest generation EP801/EP6 display. |
 | **SC-E6100** | 2.7" Large Monochrome LCD | EW-SD50 | ✅ **Supported** | Trekking/City display; broadcasts identical D-Fly telemetry. |
 | **EW-SW310 / EW-EX310** | Integrated Frame Switch | EW-SD300 | ✅ **Supported** | Clean cockpits without handlebar display. |
-| **SC-E8000** | 1.6" Color LCD (Gen 1) | EW-SD50 | ❌ **Incompatible** | **Protocol limitation:** Lacks the `0x18EF` live telemetry service (only exposes `0x18FF` for configuration). |
+| **SC-E8000** | 1.6" Color LCD (Gen 1) | EW-SD50 | ❌ **Incompatible** | **Protocol/firmware limitation:** Lacks the `0x18EF` live telemetry service. BLE operates strictly as a stationary *E-Tube* maintenance/configuration mode (`0x18FF`) that locks out motor assistance while connected, making even battery-only telemetry during rides impossible. |
 | **SC-E5000** | Compact Display | EW-SD50 | ❌ **Incompatible** | No Bluetooth LE hardware built into the unit. |
 
 *\*Note: Mixing EW-SD50 and EW-SD300 components requires the passive Shimano EW-AD305 adapter.*

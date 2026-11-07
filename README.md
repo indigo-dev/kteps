@@ -103,7 +103,7 @@ The display or junction unit dictates whether live telemetry can be transmitted 
 | **SC-EN600 / SC-EN610** | Compact Color Display | EW-SD300 | ✅ **Fully Supported** | Latest generation EP801/EP6 display. |
 | **SC-E6100** | 2.7" Large Monochrome LCD | EW-SD50 | ✅ **Fully Supported** | Trekking/City display; broadcasts identical D-Fly telemetry. |
 | **EW-SW310 / EW-EX310** | Integrated Frame Switch | EW-SD300 | ✅ **Fully Supported** | Clean cockpits without handlebar display. |
-| **SC-E8000** | 1.6" Color LCD (Gen 1) | EW-SD50 | ❌ **Not Supported** | **Hardware/firmware limitation:** Lacks the `0x18EF` live telemetry service (only exposes `0x18FF` for E-Tube configuration). |
+| **SC-E8000** | 1.6" Color LCD (Gen 1) | EW-SD50 | ❌ **Not Supported** | **Hardware/firmware limitation:** Lacks the `0x18EF` live telemetry service. Its BLE mode is strictly a stationary *E-Tube* configuration/maintenance mode (`0x18FF`) that disables motor assistance while connected, so even battery-only monitoring while riding is impossible. *(Workaround for `DU-E8000`: use `EW-EN100` or `SC-E7000`).* |
 | **SC-E5000** | Compact Display | EW-SD50 | ❌ **Not Supported** | No Bluetooth LE hardware built into the unit. |
 
 *\*Note: Mixing EW-SD50 and EW-SD300 components requires the passive Shimano EW-AD305 adapter.*
